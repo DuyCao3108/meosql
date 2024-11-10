@@ -1,0 +1,575 @@
+import json
+from datetime import datetime, timedelta
+import time
+import re
+import os
+import pyspark.sql.functions as F
+from pyspark.sql.functions import col, when, concat, lit
+from pyspark.sql import SparkSession
+from pyspark.conf import SparkConf
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+import cx_Oracle
+import pandas as pd
+import numpy as np
+import math
+from builtins import min
+import traceback
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+
+
+# For setting
+START_DATE = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+END_DATE = datetime.strftime(datetime.now(), r'%Y-%m-%d')
+HISTORY_START_DATE = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+
+email = "duy.caov@homecredit.vn"
+ora_userinfo_table = 'bdp_ap_crm.duy_ora_usertype'
+event_userinfo_pivoted = 'bdp_ap_crm.tb_crm_happy_dashboard_monitor'
+tmp_table_name = f"bdp_ap_crm.duy_tmp_{datetime.strftime(datetime.now(), '%H%M%S')}"
+
+def init_spark():
+    sparkProps = {
+        "spark.master": "yarn",
+        "spark.driver.cores": 2,  # Allows driver to handle a moderate number of tasks
+        "spark.driver.memory": "6g",  # Allocates 6 GB of memory for the driver
+        "spark.executor.cores": 2,  # 2 cores per executor for optimal parallelism without overloading
+        "spark.executor.memory": "6g",  # 6 GB of memory per executor to handle larger data
+        "spark.executor.instances": 6,  # Sets a fixed number of 6 executors for balanced workload distribution
+        "spark.port.maxRetries": "100",  # Increases port retry attempts to avoid conflicts
+
+        # Dynamic Allocation Settings
+        "spark.dynamicAllocation.minExecutors": 2,  # Minimum of 2 executors to ensure initial resource allocation
+        "spark.dynamicAllocation.initialExecutors": 2,  # Starts with 2 executors at application launch
+        "spark.dynamicAllocation.maxExecutors": 8,  # Allows up to 8 executors to scale during high-demand tasks
+    }
+    conf = SparkConf().setAll(list(sparkProps.items()))
+    spark = (
+        SparkSession.builder
+                    .appName("duysession10")
+                    .config(conf=conf)
+                    .enableHiveSupport()
+                    .getOrCreate())
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
+
+def get_ora_conn():
+    with open(os.path.join(os.getcwd(), 'config.json'), 'r') as f:
+        config = json.load(f)
+
+
+    email = config["email"]
+    ora_conn = config["ora_conn"] 
+    ora_user = config["ora_user"] 
+    ora_password = config["ora_password"]
+    host = config["host"] 
+    port = config["port"] 
+    service_name = config["service_name"] 
+
+    spark = init_spark()
+
+    # Oracle Session
+    dsn_tns = cx_Oracle.makedsn(host, port, service_name= service_name)
+    conn = cx_Oracle.connect(user=ora_user, password=ora_password, dsn=dsn_tns)
+    cursor = conn.cursor()
+    
+    return conn
+
+def get_start_end_time_tuples(start_date, end_date, split_duration):
+    # Generate list of dates
+    date_range = pd.date_range(start=start_date, end=end_date)
+
+    # Convert to list
+    date_list = [str(d).split(' ')[0] for d in date_range.tolist()]
+
+    # loop
+    date_tuples = []
+    length_dates = len(date_list)
+    interval = int(np.floor(length_dates/split_duration)) + 1
+    start_i = 0
+    end_i = 0
+    for i in range(interval):
+        end_i = min(start_i + split_duration - 1, length_dates-1)
+        date_tuples.append((date_list[start_i], date_list[end_i]))
+        start_i = end_i + 1
+        if start_i == length_dates:
+            return date_tuples
+    
+    return date_tuples
+
+def reformat_date(d):
+    return  re.sub('-', '', d) # 20240701
+
+def refresh_tables(spec_table):
+    spark.catalog.refreshTable(spec_table)
+
+def send_email(email, app_name, content, msg_type="info"):
+    message = MIMEMultipart()
+    message["from"] = "CRM BI<crmbot@homecredit.vn>"
+    message["to"] = email
+    if msg_type == "error":
+        message["subject"] = f"[ERROR] {app_name}"
+    else:
+        message["subject"] = f"{app_name}"
+    html = f"""
+        <html>
+            <body>
+                <xmp>
+                    {content}
+                </xmp>
+            </body>
+        </html>
+        """
+    part = MIMEText(html, "html")
+    message.attach(part)
+    with smtplib.SMTP(host="smtp.homecredit.vn", port=25) as smtp:
+        smtp.ehlo()
+        #smtp.starttls()
+        smtp.send_message(message)
+        
+def truncate_table(table, date_col, history_start_date, start_date, end_date,f_reformat_date=0):
+    tmp_table_name = f"bdp_ap_crm.duy_tmp_{datetime.strftime(datetime.now(), '%H%M%S')}"
+    start_date = start_date if not f_reformat_date else reformat_date(start_date)
+    end_date = end_date if not f_reformat_date else reformat_date(end_date)
+        
+    start_time = time.time()
+    sdf = spark.sql(f"""
+        SELECT 
+        * 
+        FROM {table}
+        WHERE NOT (
+            {date_col} >= '{start_date}' 
+            and {date_col} < '{end_date}'
+        )
+    """) 
+    spark.sql(f"DROP TABLE IF EXISTS {tmp_table_name}")
+    sdf.write.mode("overwrite").saveAsTable(tmp_table_name)
+    sdf = spark.sql(f"select * from {tmp_table_name}")
+    sdf.write.mode("overwrite").saveAsTable(table)
+    spark.sql(f"DROP TABLE IF EXISTS {tmp_table_name}")
+    end_time = time.time()
+    
+    
+    # date_diff = datetime.strptime(end_date, "%Y-%m-%d") - datetime.strptime(history_start_date, "%Y-%m-%d")
+    # date_tuples = get_start_end_time_tuples(
+    #     start_date=history_start_date, 
+    #     end_date=end_date, 
+    #     split_duration = math.ceil(date_diff.days/2)
+    # )
+    
+    # tuple_index = 1
+    # for date_tuple in date_tuples:
+    #     start_time = time.time()
+    #     tmp_table_name = f"bdp_ap_crm.duy_tmp_{datetime.strftime(datetime.now(), '%H%M%S')}"
+    #     start_date = date_tuple[0] if not f_reformat_date else reformat_date(date_tuple[0])
+    #     end_date = date_tuple[1]if not f_reformat_date else reformat_date(date_tuple[1])
+    #     sdf = spark.sql(f"""
+    #         SELECT 
+    #         DISTINCT * 
+    #         FROM {table}
+    #         WHERE NOT (
+    #             {date_col} >= '{start_date}' 
+    #             and {date_col} < '{end_date}'
+    #         )
+    #     """) 
+    #     spark.sql(f"DROP TABLE IF EXISTS {tmp_table_name}")
+    #     sdf.write.mode("overwrite").saveAsTable(tmp_table_name)
+    #     sdf = spark.sql(f"select * from {tmp_table_name}")
+    #     sdf.write.mode("overwrite").saveAsTable(table)
+    #     spark.sql(f"DROP TABLE IF EXISTS {tmp_table_name}")
+    #     end_time = time.time()
+    #     # log
+    #     print(f"==== TRUNCATED {tuple_index}/{len(date_tuples)} DATE TUPLES, TABLE {table} FROM {start_date} TO {end_date} IN {end_time-start_time}")
+        
+
+if __name__ == '__main__':
+    ###### INIT
+    spark = init_spark()
+    conn = get_ora_conn()
+    try:
+        send_email(
+            email, 
+            "STARTING - Happy Dashboard Monitor", 
+            f"[DuyJobMonitor] userinfo table: {ora_userinfo_table}; event table: {event_userinfo_pivoted}; from {START_DATE} to {END_DATE}", 
+            msg_type="info"
+        )
+        
+        start_time = time.time()
+        sql_query = """
+            select
+                ID_CUID,
+                ID_USER,
+                DATE_LOGIN,
+                LAST_DEVICE_OS,
+                TO_CHAR(date_login, 'YYYYMMDD') AS DATE_LOGIN_FORMATED,
+                user_type_fst_login_base_cuid as LABEL_USER_TYPE,
+                appl_f_active_inday as FLAG_ACT_CONTRACT,
+                -- CONTRACT
+                case
+                    when appl_cmb_proudct_gr_inday like '%CCX%' then 1
+                    else 0
+                end as FLAG_CONTRACT_CCX,
+                case
+                    when appl_cmb_proudct_gr_inday like '%CLX%' then 1
+                    else 0
+                end as FLAG_CONTRACT_CLX,
+                -- OFFER
+                case
+                    when ANY_FLAG_ACT_SCOR_OFFER = 1
+                    OR ANY_FLAG_ACT_PROD_OFFER = 1 then 1
+                    else 0
+                end as FLAG_ACT_OFFER,
+                case
+                    when ANY_FLAG_ACT_SCOR_OFFER = 1 then 'scoring'
+                    when ANY_FLAG_ACT_PROD_OFFER = 1 then 'product'
+                end as LABEL_OFFER_TYPE,
+                -- OFFER PRODUCTS
+                case
+                    when ANY_SCOR_OFFER_PRODUCT_CMB LIKE '%CLX%'
+                    OR ANY_PROD_OFFER_PRODUCT_CMB LIKE '%CLX%' then 1
+                    else 0
+                end as FLAG_OFFER_CLX,
+                case
+                    when ANY_SCOR_OFFER_PRODUCT_CMB LIKE '%CCX%'
+                    OR ANY_PROD_OFFER_PRODUCT_CMB LIKE '%CCX%' then 1
+                    else 0
+                end as FLAG_OFFER_CCX,
+                case
+                    when ANY_SCOR_OFFER_PRODUCT_CMB LIKE '%HPL%'
+                    OR ANY_PROD_OFFER_PRODUCT_CMB LIKE '%HPL%' then 1
+                    else 0
+                end as FLAG_OFFER_HPL
+            from
+                tb_rep_happ_login
+            where
+                date_login >= date '{start_date}'
+                and date_login < date '{end_date}'
+                and date_level = 'daily' 
+        """
+        
+        print("=============== PROCESSING ORA USER TYPE DATA =================")
+        # truncate similar dates first
+        truncate_table(
+            table=ora_userinfo_table, 
+            date_col="DATE_LOGIN_FORMATED",
+            history_start_date=HISTORY_START_DATE,
+            start_date=START_DATE, 
+            end_date=END_DATE,
+            f_reformat_date=1
+        )
+        refresh_tables(ora_userinfo_table)
+        print(f"======= DELETED {ora_userinfo_table} where date_login from {START_DATE} to {END_DATE}")
+        # Code execution
+        executed_sql = sql_query.format(
+            start_date = START_DATE, 
+            end_date = END_DATE
+        )
+        
+        df = pd.read_sql(
+            executed_sql,
+            con = conn
+        )
+        
+        sdf = spark.createDataFrame(df)
+        
+        sdf.write.mode('append').saveAsTable(ora_userinfo_table)
+        print(f"======= INSERTED {ora_userinfo_table} where date_login from {START_DATE} to {END_DATE}")
+        # End Code execution
+        
+        # refresh 
+        refresh_tables(ora_userinfo_table)
+        
+        ############################### GET EVENT AND MERGE WITH USER INFO 
+        sql_query = """
+        WITH 
+        event_raw AS (
+            -- level source_id
+            SELECT
+                kafka_timestamp AS DTIME_EVENT,
+                part_date AS DATE_EVENT,
+                s.SOURCE_ID,
+                CASE 
+                    -- to identify start session event
+                    WHEN 
+                        payload.data.eventaction = 'view'
+                        and payload.data.screenname = 'home_dashboard'
+                        and payload.data.label = 'home_dashboard' 
+                    THEN 
+                        'home_dashboard_sv'
+                    -- to identify exact action_belt
+                    WHEN 
+                        payload.data.eventaction = 'click' 
+                        and payload.data.ScreenName = 'home_dashboard'
+                        and payload.data.Properties ['label1'] = 'action_belt'
+                    THEN 
+                        CONCAT(
+                            payload.data.Properties ['label1'],
+                            '_',
+                            payload.data.userproperties ['cd_item_name']
+                        ) 
+                    -- to take home dashboard event
+                    WHEN 
+                        payload.data.eventaction = 'click' 
+                        and payload.data.ScreenName = 'home_dashboard'
+                    THEN 
+                        payload.data.Properties ['label1']
+                    -- to identify exact A/B test 
+                    WHEN 
+                        payload.data.Properties ['label1'] = 'loo_welcome_screen_clx'
+                        and payload.data.userproperties ['cd_abtest'] = 'a'
+                    THEN 
+                        'loo_welcome_screen_clx_a'
+                    WHEN 
+                        payload.data.Properties ['label1'] = 'loo_welcome_screen_clx'
+                        and payload.data.userproperties ['cd_abtest'] = 'b'
+                    THEN 
+                        'loo_welcome_screen_clx_b'
+                    WHEN 
+                        payload.data.Properties ['label1'] = 'loo_welcome_screen_scoring'
+                        and payload.data.userproperties ['cd_abtest'] = 'a'
+                    THEN 
+                        'loo_welcome_screen_scoring_a'
+                    WHEN 
+                        payload.data.Properties ['label1'] = 'loo_welcome_screen_scoring'
+                        and payload.data.userproperties ['cd_abtest'] = 'b'
+                    THEN 
+                        'loo_welcome_screen_scoring_b'
+                    -- to identify exact A/B actions
+                    WHEN 
+                        payload.data.category = 'loo_welcome_screen_clx'
+                        and payload.data.Properties ['label1'] = 'start'
+                    THEN 
+                        'loo_welcome_screen_clx_start'
+                    WHEN 
+                        payload.data.category = 'loo_welcome_screen_clx'
+                        and payload.data.Properties ['label1'] = 'skip'
+                    THEN 
+                        'loo_welcome_screen_clx_skip'
+                    WHEN 
+                        payload.data.category = 'loo_welcome_screen_scoring'
+                        and payload.data.Properties ['label1'] = 'start'
+                    THEN 
+                        'loo_welcome_screen_scoring_start'
+                    WHEN 
+                        payload.data.category = 'loo_welcome_screen_scoring'
+                        and payload.data.Properties ['label1'] = 'skip'
+                    THEN 
+                        'loo_welcome_screen_scoring_skip'
+                    
+                    ELSE    
+                        NULL
+                END AS EVENT_LABEL,
+                CASE
+                    -- to map event label with section type
+                    WHEN 
+                        payload.data.Properties ['label1'] LIKE '%action_belt%' -- all action belt event as action belt
+                        and payload.data.eventaction = 'click' 
+                        and payload.data.ScreenName = 'home_dashboard'
+                        THEN 'Action_Belt_Section'
+                    -- to map event label with section type
+                    WHEN 
+                        payload.data.Properties ['label1'] IN ('income_banner', 'product_banner', 'scoring_banner') -- all action belt event as action belt
+                        and payload.data.eventaction = 'click' 
+                        THEN 'Scoring_Banner_Section'
+                    ELSE NULL
+                END AS SECTION_TYPE
+            FROM
+                -- this join part exclude sessions that dont have event 'view home_dashboard' 
+                (
+                    SELECT 
+                        DISTINCT payload.device ['SourceId'] as SOURCE_ID
+                    FROM 
+                        gma_curated.gma_device_v3
+                    where 1=1  
+                        and part_date >= {start_date_reformed} 
+                        and part_date < {end_date_reformed} 
+                        and payload.data.eventaction = 'view'
+                        and payload.data.screenname = 'home_dashboard'
+                        and payload.data.label = 'home_dashboard' 
+                ) s 
+                INNER JOIN gma_curated.gma_device_v3 d 
+                ON s.SOURCE_ID = d.payload.device ['SourceId']
+            WHERE
+                1 = 1
+                AND part_date >= {start_date_reformed}
+                AND part_date < {end_date_reformed}
+        ),
+        sourcid_cuid_map AS (
+            SELECT
+                payload.cuid AS ID_CUID,
+                payload.`user`.sourceid AS SOURCE_ID,
+                ROW_NUMBER() OVER (
+                    PARTITION BY payload.`user`.sourceid
+                    ORDER BY
+                        kafka_timestamp DESC
+                ) AS rn
+            FROM
+                gma_curated.user_update_v3_2
+            WHERE
+                payload.registration IS NULL
+                AND payload.block.isblocked IS NULL
+                AND payload.biometricsenabled IS NULL
+        ),
+        event_userinfo AS (
+            -- use cuid to get user info
+            SELECT
+                r.DATE_EVENT,
+                m.ID_CUID,
+                r.SOURCE_ID,
+                LAST_DEVICE_OS,
+                r.EVENT_LABEL,
+                r.section_type,
+                -- flag for user type
+                u.label_user_type, 
+                u.flag_act_contract, 
+                u.flag_contract_ccx, 
+                u.flag_contract_clx, 
+                u.flag_act_offer, 
+                u.label_offer_type,
+                u.flag_offer_clx, 
+                u.flag_offer_ccx, 
+                u.flag_offer_hpl,
+                -- COUNT(DISTINCT r.SOURCE_ID) AS CNT_SOURCEID
+                1 AS CNT_SOURCEID
+            FROM
+                event_raw r
+                LEFT JOIN sourcid_cuid_map m 
+                    ON r.SOURCE_ID = m.SOURCE_ID
+                    AND m.rn = 1
+                LEFT JOIN {ora_userinfo_table} u 
+                    ON COALESCE(m.ID_CUID, r.SOURCE_ID) = u.id_user 
+                    AND r.date_event = u.DATE_LOGIN_FORMATED
+            WHERE 1=1 
+                AND r.event_label IS NOT NULL 
+            GROUP BY
+                r.DATE_EVENT,
+                r.section_type,
+                m.ID_CUID,
+                r.SOURCE_ID,
+                LAST_DEVICE_OS,
+                r.EVENT_LABEL,
+                u.label_user_type, 
+                u.flag_act_contract, 
+                u.flag_contract_ccx, 
+                u.flag_contract_clx, 
+                u.flag_act_offer, 
+                u.label_offer_type,
+                u.flag_offer_clx, 
+                u.flag_offer_ccx, 
+                u.flag_offer_hpl
+        )
+        SELECT 
+            date_event,
+            id_cuid,
+            SOURCE_ID,
+            LAST_DEVICE_OS,
+            label_user_type, 
+            flag_act_contract, 
+            flag_contract_ccx, 
+            flag_contract_clx, 
+            flag_act_offer, 
+            label_offer_type,
+            flag_offer_clx, 
+            flag_offer_ccx, 
+            flag_offer_hpl,
+            -- PIVOT FOR TOTAL EVENT COUNT
+            SUM(CASE WHEN event_label = 'action_belt_Card registration' THEN CNT_SOURCEID ELSE 0 END) AS Action_belt_Cardregistration,
+            SUM(CASE WHEN event_label = 'action_belt_Guest_CreditCard' THEN CNT_SOURCEID ELSE 0 END) AS Action_belt_Guest_CreditCard,
+            SUM(CASE WHEN event_label = 'action_belt_Loan' THEN CNT_SOURCEID ELSE 0 END) AS Action_belt_Loan,
+            SUM(CASE WHEN event_label = 'action_belt_bike_loan' THEN CNT_SOURCEID ELSE 0 END) AS Action_belt_Bike_Loan,
+            SUM(CASE WHEN event_label = 'action_belt_bill_payment' THEN CNT_SOURCEID ELSE 0 END) AS Action_belt_Bill_Payment,
+            SUM(CASE WHEN event_label = 'action_belt_elec_loan' THEN CNT_SOURCEID ELSE 0 END) AS Action_belt_Elec_Loan,
+            SUM(CASE WHEN event_label = 'action_belt_home_paylater' THEN CNT_SOURCEID ELSE 0 END) AS Action_belt_Home_Paylater,
+            SUM(CASE WHEN event_label = 'action_belt_loads' THEN CNT_SOURCEID ELSE 0 END) AS Action_belt_Loads,
+            SUM(CASE WHEN event_label = 'action_belt_loan_registration' THEN CNT_SOURCEID ELSE 0 END) AS Action_belt_Loan_Registration,
+            SUM(CASE WHEN event_label = 'action_belt_screen_insurance' THEN CNT_SOURCEID ELSE 0 END) AS Action_belt_Screen_Insurance,
+            SUM(CASE WHEN event_label = 'income_banner' THEN CNT_SOURCEID ELSE 0 END) AS Income_banner,
+            SUM(CASE WHEN event_label = 'installments_banner' THEN CNT_SOURCEID ELSE 0 END) AS Installments_banner,
+            SUM(CASE WHEN event_label = 'loo_welcome_screen_clx_a' THEN CNT_SOURCEID ELSE 0 END) AS CLX_Popup_A,
+            SUM(CASE WHEN event_label = 'loo_welcome_screen_clx_b' THEN CNT_SOURCEID ELSE 0 END) AS CLX_Popup_B,
+            SUM(CASE WHEN event_label = 'loo_welcome_screen_clx_skip' THEN CNT_SOURCEID ELSE 0 END) AS CLX_Popup_Skip,
+            SUM(CASE WHEN event_label = 'loo_welcome_screen_clx_start' THEN CNT_SOURCEID ELSE 0 END) AS CLX_Popup_Start,
+            SUM(CASE WHEN event_label = 'loo_welcome_screen_scoring_a' THEN CNT_SOURCEID ELSE 0 END) AS Scoring_Popup_A,
+            SUM(CASE WHEN event_label = 'loo_welcome_screen_scoring_b' THEN CNT_SOURCEID ELSE 0 END) AS Scoring_Popup_B,
+            SUM(CASE WHEN event_label = 'loo_welcome_screen_scoring_skip' THEN CNT_SOURCEID ELSE 0 END) AS Scoring_Popup_Skip,
+            SUM(CASE WHEN event_label = 'loo_welcome_screen_scoring_start' THEN CNT_SOURCEID ELSE 0 END) AS Scoring_Popup_Start,
+            SUM(CASE WHEN event_label = 'pending_Action' THEN CNT_SOURCEID ELSE 0 END) AS Pending_action,
+            SUM(CASE WHEN event_label = 'product_banner' THEN CNT_SOURCEID ELSE 0 END) AS Product_banner,
+            SUM(CASE WHEN event_label = 'sas_hero_banner' THEN CNT_SOURCEID ELSE 0 END) AS Hero_banner,
+            SUM(CASE WHEN event_label = 'scoring_banner' THEN CNT_SOURCEID ELSE 0 END) AS Scoring_banner,
+            SUM(CASE WHEN event_label = 'home_dashboard_sv' THEN CNT_SOURCEID ELSE 0 END) AS Home_dashboard_SV,
+            -- PIVOT FOR SECTION TYPES
+            MAX(CASE WHEN section_type = 'Action_Belt_Section' THEN CNT_SOURCEID ELSE 0 END) AS Action_Belt_Section,
+            MAX(CASE WHEN section_type = 'Scoring_Banner_Section' THEN CNT_SOURCEID ELSE 0 END) AS Scoring_Banner_Section,
+            -- GET FLAGS FOR POPUPS
+            MAX(CASE WHEN event_label = 'loo_welcome_screen_clx_a' THEN 1 ELSE 0 END) AS flag_clx_popup_a,
+            MAX(CASE WHEN event_label = 'loo_welcome_screen_clx_b' THEN 1 ELSE 0 END) AS flag_clx_popup_b,
+            MAX(CASE WHEN event_label = 'loo_welcome_screen_scoring_a' THEN 1 ELSE 0 END) AS flag_scoring_popup_a,
+            MAX(CASE WHEN event_label = 'loo_welcome_screen_scoring_b' THEN 1 ELSE 0 END) AS flag_scoring_popup_b,
+            MAX(CASE WHEN event_label = 'loo_welcome_screen_clx_a' OR event_label = 'loo_welcome_screen_clx_b' THEN 1 ELSE 0 END) AS flag_clx_popup,
+            MAX(CASE WHEN event_label = 'loo_welcome_screen_scoring_a' OR event_label = 'loo_welcome_screen_scoring_b' THEN 1 ELSE 0 END) AS flag_scoring_popup
+        FROM 
+            event_userinfo
+        GROUP BY 
+            date_event,
+            id_cuid,
+            SOURCE_ID,
+            LAST_DEVICE_OS,
+            label_user_type, 
+            flag_act_contract, 
+            flag_contract_ccx, 
+            flag_contract_clx, 
+            flag_act_offer, 
+            label_offer_type,
+            flag_offer_clx, 
+            flag_offer_ccx, 
+            flag_offer_hpl
+        """
+        print("=============== PROCESSING EVENT TABLE =================")
+        # truncate similar dates first
+        truncate_table(
+            table=event_userinfo_pivoted, 
+            date_col="date_event",
+            history_start_date=HISTORY_START_DATE,
+            start_date=START_DATE, 
+            end_date=END_DATE,
+            f_reformat_date=1
+        )
+        refresh_tables(event_userinfo_pivoted)
+        print(f"======= DELETED {event_userinfo_pivoted} where date_event from {START_DATE} to {END_DATE}")
+        # code execution
+        sdf = spark.sql(sql_query.format(
+            start_date_reformed = reformat_date(START_DATE),
+            end_date_reformed = reformat_date(END_DATE),
+            ora_userinfo_table = ora_userinfo_table
+        ))
+        
+        sdf.write.mode('append').saveAsTable(event_userinfo_pivoted)
+        print(f"======= INSERTED {event_userinfo_pivoted} where date_event from {START_DATE} to {END_DATE}")
+
+        end_time = time.time()
+        # Calculate the time taken
+        execution_time = end_time - start_time
+        
+        refresh_tables(event_userinfo_pivoted)
+        
+        send_email(
+            email, 
+            "SUCEEDED - Happy Dashboard Monitor", 
+            f"[DuyJobMonitor] userinfo table: {ora_userinfo_table}; event table: {event_userinfo_pivoted}; from {START_DATE} to {END_DATE}", 
+            msg_type="info"
+        )
+        spark.stop()
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        log.error(e)
+        send_email(
+            email, 
+            "FAILED - Happy Dashboard Monitor", 
+            f"[DuyJobMonitor] userinfo table: {ora_userinfo_table}; event table: {event_userinfo_pivoted}; from {START_DATE} to {END_DATE}", 
+            msg_type="info"
+        )
+        spark.stop()
